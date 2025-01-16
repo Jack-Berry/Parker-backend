@@ -1,16 +1,17 @@
 const express = require("express");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcrypt");
+require("dotenv").config();
 
 const router = express.Router();
-const JWT_SECRET = "bertieparker";
+const JWT_SECRET = process.env.JWT_SECRET;
 
-// Mocked user data
+// Mocked user data with hashed password
 const users = [
   {
     id: 1,
     username: "admin",
-    password: "admin123",
+    password: "$2b$10$wS0kDzKfQ7tWtqJRo6Ob6OUpLU.OQL.u3ltiH/aBm.VVqdrW2CrsW", // Hashed version of "admin123"
   },
 ];
 
@@ -19,7 +20,12 @@ router.post("/login", async (req, res) => {
   const { username, password } = req.body;
   const user = users.find((u) => u.username === username);
 
-  if (!user || user.password !== password) {
+  if (!user) {
+    return res.status(401).json({ error: "Invalid username or password" });
+  }
+
+  const isPasswordValid = await bcrypt.compare(password, user.password);
+  if (!isPasswordValid) {
     return res.status(401).json({ error: "Invalid username or password" });
   }
 
