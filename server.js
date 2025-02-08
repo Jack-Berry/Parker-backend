@@ -4,6 +4,7 @@ const request = require("superagent");
 const { google } = require("googleapis");
 const bodyParser = require("body-parser");
 const { router: authRoutes, authenticateToken } = require("./auth");
+const { sendEmail } = require("./emailService");
 const cors = require("cors");
 require("dotenv").config();
 const { pool } = require("./db");
@@ -19,6 +20,7 @@ const corsOptions = {
   ],
   methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
   credentials: true,
+  allowedHeaders: ["Content-Type", "Authorization"],
 };
 
 app.use(cors(corsOptions));
@@ -54,28 +56,45 @@ app.get("/api/events", async (req, res) => {
   }
 });
 
-app.post("/add-event", async (req, res) => {
+app.post("/api/add-event", async (req, res) => {
   const { startDate, endDate, summary, description } = req.body;
+
+  console.log("📅 Received request to add event:", req.body);
 
   try {
     const event = {
       summary,
       description,
-      start: { dateTime: startDate, timeZone: "America/New_York" },
-      end: { dateTime: endDate, timeZone: "America/New_York" },
+      start: {
+        dateTime: new Date(startDate).toISOString(),
+        timeZone: "Europe/London",
+      },
+      end: {
+        dateTime: new Date(endDate).toISOString(),
+        timeZone: "Europe/London",
+      },
     };
 
     const calendarId = process.env.BOOKCAL_ID;
+
+    console.log("🚀 Sending request to Google Calendar API...");
 
     const response = await calendar.events.insert({
       calendarId: calendarId || "primary",
       resource: event,
     });
 
-    res.send({ eventLink: response.data.htmlLink });
+    console.log("✅ Event successfully added:", response.data);
+
+    res.json({ eventLink: response.data.htmlLink });
   } catch (error) {
-    console.error("Error adding event:", error);
-    res.status(500).send("Failed to create event.");
+    console.error(
+      "❌ Error adding event:",
+      error.response ? error.response.data : error.message
+    );
+    res
+      .status(500)
+      .json({ error: "Failed to create event", details: error.message });
   }
 });
 
@@ -103,17 +122,6 @@ app.get("/api/test-db", async (req, res) => {
     });
   }
 });
-
-// app.get("/api/test-db", async (req, res) => {
-//   try {
-//     const [rows] = await pool.query("SELECT 1 + 1 AS result;");
-//     console.log("Database connection successful:", rows);
-//     res.json({ success: true, result: rows });
-//   } catch (err) {
-//     console.error("Database connection failed:", err.message);
-//     res.status(500).json({ error: "Database connection failed" });
-//   }
-// });
 
 app.get("/api/prices", async (req, res) => {
   try {
@@ -236,6 +244,202 @@ app.post("/api/prices/total", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Error calculating total price" });
+  }
+});
+
+app.post("/api/send-booking-emails", async (req, res) => {
+  const {
+    name,
+    email,
+    numberOfPeople,
+    numberOfPets,
+    telephone,
+    message,
+    startDate,
+    endDate,
+    totalPrice, // Add totalPrice from the request body
+  } = req.body;
+
+  try {
+    const formatDate = (dateString) => {
+      const date = new Date(dateString);
+      const day = String(date.getDate()).padStart(2, "0");
+      const month = String(date.getMonth() + 1).padStart(2, "0");
+      const year = date.getFullYear();
+      return `${day}/${month}/${year}`;
+    };
+
+    const formattedStartDate = formatDate(startDate);
+    const formattedEndDate = formatDate(endDate);
+
+    const customerEmailHtml = `
+      <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; border-radius: 5px; background-color: #f9f9f9;">
+        <div style="text-align: center; padding-bottom: 20px;">
+          <div style="background-color: #000; display: inline-block; padding: 10px; border-radius: 5px;">
+            <img src="https://holidayhomesandlets.co.uk/static/media/Bwythn_Preswylfa_Logo_Enhanced.80503fa2351394cb86a6.png" 
+              alt="Holiday Homes Logo" width="200" />
+          </div>
+        </div>
+        
+        <h2 style="color: #333;">Booking Confirmation</h2>
+        <p>Dear <strong>${name}</strong>,</p>
+        <p>Thank you for your booking request! We are reviewing your details and will confirm shortly.</p>
+
+        <h3 style="color: #555;">Booking Details:</h3>
+        <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
+          <tr style="background-color: #eee;">
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Check-in Date:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${formattedStartDate}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Check-out Date:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${formattedEndDate}</td>
+          </tr>
+          <tr style="background-color: #eee;">
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Number of Guests:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${numberOfPeople}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Number of Pets:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${numberOfPets}</td>
+          </tr>
+          <tr style="background-color: #eee;">
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Total Price:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">£${totalPrice.toFixed(
+              2
+            )}</td>
+          </tr>
+        </table>
+
+        <p>If you have any questions, feel free to contact us at <a href="mailto:hello@holidayhomesandlets.co.uk" style="color: #555; text-decoration: none;">hello@holidayhomesandlets.co.uk</a>.</p>
+
+        <div style="text-align: center; margin-top: 20px;">
+          <a href="https://holidayhomesandlets.co.uk" style="background-color: #008CBA; color: white; padding: 10px 15px; text-decoration: none; border-radius: 5px;">
+            Visit Our Website
+          </a>
+        </div>
+      </div>
+    `;
+
+    const adminEmailHtml = `
+      <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; border-radius: 5px; background-color: #f9f9f9;">
+        <div style="text-align: center; padding-bottom: 20px;">
+          <div style="background-color: #000; display: inline-block; padding: 10px; border-radius: 5px;">
+            <img src="https://holidayhomesandlets.co.uk/static/media/Bwythn_Preswylfa_Logo_Enhanced.80503fa2351394cb86a6.png" 
+              alt="Holiday Homes Logo" width="200" />
+          </div>
+        </div>
+        
+        <h2 style="color: #333;">New Booking Request</h2>
+        <p>Hello Lucy,</p>
+        <p>A new booking request has been received. The details are as follows:</p>
+
+        <h3 style="color: #555;">Booking Details:</h3>
+        <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
+          <tr style="background-color: #eee;">
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Name:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${name}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Email:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${email}</td>
+          </tr>
+          <tr style="background-color: #eee;">
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Phone:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${telephone}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Check-in Date:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${formattedStartDate}</td>
+          </tr>
+          <tr style="background-color: #eee;">
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Check-out Date:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${formattedEndDate}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Number of Guests:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${numberOfPeople}</td>
+          </tr>
+          <tr style="background-color: #eee;">
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Number of Pets:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${numberOfPets}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Total Price:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">£${totalPrice.toFixed(
+              2
+            )}</td>
+          </tr>
+        </table>
+
+        <p><strong>Message from Customer:</strong></p>
+        <p>${message}</p>
+
+      </div>
+    `;
+
+    await Promise.all([
+      sendEmail(email, "Your Booking Request Confirmation", customerEmailHtml),
+      sendEmail(
+        process.env.EMAIL_USER, // Admin email
+        "New Booking Request", // Subject
+        adminEmailHtml, // Styled admin email
+        email // Reply-to set to customer
+      ),
+    ]);
+
+    res.status(200).json({ message: "Emails sent successfully" });
+  } catch (error) {
+    console.error("Error sending emails:", error);
+    res.status(500).json({ error: "Failed to send emails" });
+  }
+});
+
+app.post("/api/contact", async (req, res) => {
+  const { name, email, message } = req.body;
+
+  try {
+    const emailHtml = `
+      <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; border-radius: 5px; background-color: #f9f9f9;">
+        <div style="text-align: center; padding-bottom: 20px;">
+          <div style="background-color: #000; display: inline-block; padding: 10px; border-radius: 5px;">
+            <img src="https://holidayhomesandlets.co.uk/static/media/Bwythn_Preswylfa_Logo_Enhanced.80503fa2351394cb86a6.png" 
+              alt="Holiday Homes Logo" width="200" />
+          </div>
+        </div>
+        
+        <h2 style="color: #333;">New Contact Request</h2>
+        <p>Hello Lucy,</p>
+        <p>A new contact request has been received. The details are as follows:</p>
+
+        <h3 style="color: #555;">Contact Details:</h3>
+        <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
+          <tr style="background-color: #eee;">
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Name:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${name}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Email:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${email}</td>
+          </tr>
+        </table>
+
+        <h3 style="color: #555; margin-top: 20px;">Message:</h3>
+        <p style="background-color: #f4f4f4; padding: 10px; border-radius: 5px; border: 1px solid #ddd;">${message}</p>
+      </div>
+    `;
+
+    await sendEmail(
+      process.env.EMAIL_USER, // Admin's email
+      "New Contact Request", // Email subject
+      emailHtml, // Styled HTML content
+      email // Reply-to set to customer's email
+    );
+
+    res.status(200).json({ message: "Message sent successfully!" });
+  } catch (error) {
+    console.error("Error sending contact email:", error);
+    res.status(500).json({ error: "Failed to send message" });
   }
 });
 
