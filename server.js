@@ -1,67 +1,177 @@
-const express = require("express");
-const mysql = require("mysql2/promise"); // Correctly import mysql2
-const request = require("superagent");
-const { google } = require("googleapis");
-const bodyParser = require("body-parser");
-const { router: authRoutes, authenticateToken } = require("./auth");
-const { sendEmail } = require("./emailService");
-const cors = require("cors");
 require("dotenv").config();
-const { pool } = require("./db");
+
+const express = require("express");
+const cors = require("cors");
+const bodyParser = require("body-parser");
+const superagent = require("superagent");
+const { google } = require("googleapis");
+
+const { pool, query } = require("./db"); // shared mysql2/promise pool
+const { sendEmail } = require("./emailService"); // centralized email helper
+const { router: authRoutes } = require("./auth"); // your existing auth router
 
 const app = express();
-const corsOptions = {
-  origin: [
-    "http://localhost:3000",
-    "http://holidayhomesandlets.co.uk",
-    "https://holidayhomesandlets.co.uk",
-    "http://www.holidayhomesandlets.co.uk",
-    "https://www.holidayhomesandlets.co.uk",
-  ],
-  methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
-  credentials: true,
-  allowedHeaders: ["Content-Type", "Authorization"],
-};
 
+// ----- CORS -----
+// Use a safe default that can be narrowed via env (comma-separated)
+const allowlist = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const corsOptions = {
+  origin: (origin, cb) => {
+    if (!origin || allowlist.length === 0 || allowlist.includes(origin))
+      return cb(null, true);
+    return cb(new Error("Not allowed by CORS"));
+  },
+  credentials: true,
+};
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
+
+// ----- Body parsing -----
 app.use(bodyParser.json());
+
+// Mount your existing /api auth endpoints
 app.use("/api", authRoutes);
 
+// ---------------------------------------
+// Google Calendar config
+// ---------------------------------------
 const GOOGLE_CALENDAR_URL = "https://www.googleapis.com/calendar/v3/calendars";
 
-const auth = new google.auth.JWT({
+// Service account auth (newline normalization for .env)
+function normalizePrivateKey(pk) {
+  return pk ? pk.replace(/\\n/g, "\n") : pk;
+}
+
+const jwtClient = new google.auth.JWT({
   email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-  key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+  key: normalizePrivateKey(process.env.GOOGLE_PRIVATE_KEY || ""),
   scopes: ["https://www.googleapis.com/auth/calendar.events"],
 });
 
-const calendar = google.calendar({ version: "v3", auth });
+const calendar = google.calendar({ version: "v3", auth: jwtClient });
 
-app.get("/api/events", async (req, res) => {
-  const calendarId = process.env.BNBCALENDAR_ID;
-  const apiKey = process.env.GOOGLE_API_KEY;
+// Per-property calendar mapping (read & write). Add more properties here.
+const PROPERTY_CALENDARS = {
+  // Slugs should match your frontend route param values
+  preswylfa: {
+    readCalendarId:
+      process.env.PRESWYLFA_READ_CAL ||
+      process.env.BNBCALENDAR_ID ||
+      "not_configured",
+    writeCalendarId:
+      process.env.PRESWYLFA_WRITE_CAL ||
+      process.env.BOOKCAL_ID ||
+      "not_configured",
+    displayName: "Bwthyn Preswylfa",
+    logoUrl:
+      "https://holidayhomesandlets.co.uk/static/media/Bwythn_Preswylfa_Logo_Enhanced.80503fa2351394cb86a6.png",
+  },
+  "piddle-inn": {
+    readCalendarId: process.env.PIDDLE_READ_CAL || "not_configured",
+    writeCalendarId: process.env.PIDDLE_WRITE_CAL || "not_configured",
+    displayName: "Piddle Inn",
+    logoUrl: "https://holidayhomesandlets.co.uk/logo.svg", // replace when you have one
+  },
+};
 
-  if (!calendarId || !apiKey) {
-    return res.status(400).send("Missing Calendar ID or API Key.");
+const VALID_PROPERTIES = Object.keys(PROPERTY_CALENDARS);
+
+function getPropertyConfig(propertyId) {
+  const cfg = PROPERTY_CALENDARS[propertyId];
+  if (!cfg) throw new Error(`Unknown property: ${propertyId}`);
+  return cfg;
+}
+
+function ensureValidProperty(req, res) {
+  const { propertyId } = req.params;
+  if (!VALID_PROPERTIES.includes(propertyId)) {
+    res.status(400).json({ error: `Unknown property: ${propertyId}` });
+    return null;
+  }
+  return propertyId;
+}
+
+const apiKey = process.env.GOOGLE_API_KEY; // used for reads
+
+// ---------------------------------------
+// Utilities
+// ---------------------------------------
+function parseIsoDateOnly(d) {
+  return d.toISOString().split("T")[0];
+}
+
+function formatDdMmYyyy(dateString) {
+  const d = new Date(dateString);
+  if (isNaN(d)) return "—";
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  return `${dd}/${mm}/${yyyy}`;
+}
+
+// ---------------------------------------
+// Health
+// ---------------------------------------
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// ---------------------------------------
+// Events (READ) – property-scoped
+// GET /api/events/:propertyId
+// ---------------------------------------
+app.get("/api/events/:propertyId", async (req, res) => {
+  const propertyId = ensureValidProperty(req, res);
+  if (!propertyId) return;
+
+  if (!apiKey) {
+    return res.status(500).json({ error: "Missing GOOGLE_API_KEY" });
   }
 
-  const url = `${GOOGLE_CALENDAR_URL}/${calendarId}/events?key=${apiKey}`;
   try {
-    const response = await request.get(url);
+    const { readCalendarId } = getPropertyConfig(propertyId);
+    if (!readCalendarId || readCalendarId === "not_configured") {
+      // Keep frontend stable: return empty items, not a hard error
+      return res.json({ items: [] });
+    }
+
+    const url = `${GOOGLE_CALENDAR_URL}/${encodeURIComponent(
+      readCalendarId
+    )}/events?key=${apiKey}`;
+    const response = await superagent.get(url);
     res.json(JSON.parse(response.text));
-  } catch (error) {
-    console.error("Error fetching Google Calendar events:", error);
-    res.status(500).send("Error fetching events.");
+  } catch (err) {
+    console.error(`Error fetching events for ${propertyId}:`, err.message);
+    res.json({ items: [] });
   }
 });
 
-app.post("/api/add-event", async (req, res) => {
-  const { startDate, endDate, summary, description } = req.body;
+// ---------------------------------------
+// Events (WRITE) – property-scoped
+// POST /api/add-event/:propertyId
+// body: { startDate, endDate, summary, description }
+// ---------------------------------------
+app.post("/api/add-event/:propertyId", async (req, res) => {
+  const propertyId = ensureValidProperty(req, res);
+  if (!propertyId) return;
 
-  console.log("📅 Received request to add event:", req.body);
+  const { startDate, endDate, summary, description } = req.body || {};
+  if (!startDate || !endDate || !summary) {
+    return res.status(400).json({
+      error: "Missing required fields",
+      details: "startDate, endDate, and summary are required",
+    });
+  }
 
   try {
+    const { writeCalendarId } = getPropertyConfig(propertyId);
+    if (!writeCalendarId || writeCalendarId === "not_configured") {
+      return res.status(400).json({
+        error: "Calendar not configured",
+        message: "Booking system not yet available for this property.",
+      });
+    }
+
     const event = {
       summary,
       description,
@@ -75,179 +185,256 @@ app.post("/api/add-event", async (req, res) => {
       },
     };
 
-    const calendarId = process.env.BOOKCAL_ID;
-
-    console.log("🚀 Sending request to Google Calendar API...");
-
     const response = await calendar.events.insert({
-      calendarId: calendarId || "primary",
+      calendarId: writeCalendarId,
       resource: event,
     });
 
-    console.log("✅ Event successfully added:", response.data);
-
-    res.json({ eventLink: response.data.htmlLink });
+    res.json({ eventLink: response?.data?.htmlLink || null });
   } catch (error) {
     console.error(
-      "❌ Error adding event:",
-      error.response ? error.response.data : error.message
+      `Error adding event for ${propertyId}:`,
+      error?.response?.data || error.message
     );
-    res
-      .status(500)
-      .json({ error: "Failed to create event", details: error.message });
+    res.status(500).json({ error: "Failed to create event" });
   }
 });
 
-// Temporary test route to check database connection
-app.get("/api/test-db", async (req, res) => {
+// ---------------------------------------
+// Pricing – property-scoped
+// GET /api/prices/:propertyId
+// ---------------------------------------
+app.get("/api/prices/:propertyId", async (req, res) => {
+  const propertyId = ensureValidProperty(req, res);
+  if (!propertyId) return;
+
   try {
-    const connection = await mysql.createConnection({
-      host: process.env.DB_HOST,
-      user: process.env.DB_USER,
-      password: process.env.DB_PASSWORD,
-      database: process.env.DB_NAME,
-      port: process.env.DB_PORT || 3306,
-    });
-
-    console.log("Database connected successfully");
-    res.json({ success: true, message: "Database connected successfully" });
-
-    await connection.end();
-  } catch (error) {
-    console.error("Error connecting to the database:", error.message);
-    res.status(500).json({
-      success: false,
-      error: "Error connecting to the database",
-      message: error.message,
-    });
-  }
-});
-
-app.get("/api/prices", async (req, res) => {
-  try {
-    const [standardPriceResult] = await pool.query(
-      "SELECT value FROM standard_price LIMIT 1;"
+    const [standardPriceRows] = await pool.query(
+      "SELECT value FROM standard_price WHERE property_id = ? LIMIT 1;",
+      [propertyId]
     );
-    const [datePricesResult] = await pool.query(
-      "SELECT id, date, price FROM date_prices ORDER BY date;"
+    const [datePriceRows] = await pool.query(
+      "SELECT id, date, price FROM date_prices WHERE property_id = ? ORDER BY date;",
+      [propertyId]
     );
-
-    const datePrices = datePricesResult.map((row) => ({
-      id: row.id,
-      date: row.date,
-      price: row.price,
-    }));
 
     res.json({
-      standardPrice: standardPriceResult[0]?.value || 0,
-      datePrices,
+      standardPrice: standardPriceRows?.[0]?.value ?? 150,
+      datePrices: datePriceRows.map((r) => ({
+        id: r.id,
+        date: r.date,
+        price: r.price,
+      })),
     });
   } catch (err) {
-    res.status(500).json({
-      error: "Failed to fetch prices",
-      message: err.message,
-      stack: err.stack,
-    });
+    console.error(`Error fetching prices for ${propertyId}:`, err);
+    res.status(500).json({ error: "Failed to fetch prices" });
   }
 });
 
-app.put("/api/prices/standard", async (req, res) => {
-  const { price } = req.body;
+// ---------------------------------------
+// Update standard price – property-scoped
+// PUT /api/prices/standard/:propertyId
+// body: { price }
+// ---------------------------------------
+app.put("/api/prices/standard/:propertyId", async (req, res) => {
+  const propertyId = ensureValidProperty(req, res);
+  if (!propertyId) return;
+
+  const { price } = req.body || {};
+  if (price == null || Number.isNaN(Number(price))) {
+    return res.status(400).json({ error: "Invalid or missing 'price'" });
+  }
+
   try {
-    await pool.query("UPDATE standard_price SET value = ? WHERE id = 1;", [
-      price,
-    ]);
+    const [result] = await pool.query(
+      "UPDATE standard_price SET value = ? WHERE property_id = ?;",
+      [price, propertyId]
+    );
+
+    if (result.affectedRows === 0) {
+      await pool.query(
+        "INSERT INTO standard_price (property_id, value) VALUES (?, ?);",
+        [propertyId, price]
+      );
+    }
+
     res.json({ message: "Standard price updated" });
   } catch (err) {
-    console.error(err);
+    console.error(`Error updating standard price for ${propertyId}:`, err);
     res.status(500).json({ error: "Failed to update standard price" });
   }
 });
 
-app.post("/api/prices/date-range", async (req, res) => {
-  const { dates, price } = req.body;
+// ---------------------------------------
+// Upsert date prices for a range – property-scoped
+// POST /api/prices/date-range/:propertyId
+// body: { dates: ["YYYY-MM-DD", ...], price }
+// ---------------------------------------
+app.post("/api/prices/date-range/:propertyId", async (req, res) => {
+  const propertyId = ensureValidProperty(req, res);
+  if (!propertyId) return;
+
+  const { dates, price } = req.body || {};
+  if (!Array.isArray(dates) || dates.length === 0) {
+    return res.status(400).json({ error: "No dates provided" });
+  }
+  if (price == null || Number.isNaN(Number(price))) {
+    return res.status(400).json({ error: "Invalid or missing 'price'" });
+  }
 
   try {
-    const queries = dates.map((date) =>
+    const statements = dates.map((d) =>
       pool.query(
-        `INSERT INTO date_prices (date, price)
-         VALUES (?, ?)
-         ON DUPLICATE KEY UPDATE price = ?;`,
-        [date, price, price]
+        `INSERT INTO date_prices (date, price, property_id)
+         VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE price = VALUES(price);`,
+        [d, price, propertyId]
       )
     );
 
-    await Promise.all(queries);
+    await Promise.all(statements);
 
-    const [result] = await pool.query(
-      "SELECT * FROM date_prices ORDER BY date;"
+    const [rows] = await pool.query(
+      "SELECT id, date, price FROM date_prices WHERE property_id = ? ORDER BY date;",
+      [propertyId]
     );
-    res.json({ datePrices: result });
+
+    res.json({ datePrices: rows });
   } catch (err) {
-    console.error(err);
+    console.error(`Error updating date prices for ${propertyId}:`, err);
     res
       .status(500)
       .json({ error: "Failed to update prices for selected dates" });
   }
 });
 
-app.delete("/api/prices/date-range/:id", async (req, res) => {
+// ---------------------------------------
+// Delete a specific date price – property-scoped
+// DELETE /api/prices/date-range/:propertyId/:id
+// ---------------------------------------
+app.delete("/api/prices/date-range/:propertyId/:id", async (req, res) => {
+  const propertyId = ensureValidProperty(req, res);
+  if (!propertyId) return;
+
   const { id } = req.params;
+
   try {
-    await pool.query("DELETE FROM date_prices WHERE id = ?;", [id]);
-    const [result] = await pool.query("SELECT * FROM date_prices;");
-    res.json({ datePrices: result });
+    await pool.query(
+      "DELETE FROM date_prices WHERE id = ? AND property_id = ?;",
+      [id, propertyId]
+    );
+
+    const [rows] = await pool.query(
+      "SELECT id, date, price FROM date_prices WHERE property_id = ? ORDER BY date;",
+      [propertyId]
+    );
+
+    res.json({ datePrices: rows });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to delete date range price" });
+    console.error(`Error deleting date price for ${propertyId}:`, err);
+    res.status(500).json({ error: "Failed to delete date price" });
   }
 });
 
-app.post("/api/prices/total", async (req, res) => {
-  const { startDate, endDate } = req.body;
+// ---------------------------------------
+// Calculate total – property-scoped
+// POST /api/prices/total/:propertyId
+// body: { startDate, endDate }
+// ---------------------------------------
+app.post("/api/prices/total/:propertyId", async (req, res) => {
+  const propertyId = ensureValidProperty(req, res);
+  if (!propertyId) return;
+
+  const { startDate, endDate } = req.body || {};
+  if (!startDate || !endDate) {
+    return res
+      .status(400)
+      .json({ error: "startDate and endDate are required" });
+  }
 
   try {
     const start = new Date(startDate);
     const end = new Date(endDate);
+    if (isNaN(start) || isNaN(end)) {
+      return res.status(400).json({ error: "Invalid date format" });
+    }
 
-    let currentDate = new Date(start);
+    // Fetch standard price ONCE (perf win)
+    const [standardRows] = await pool.query(
+      "SELECT value FROM standard_price WHERE property_id = ? LIMIT 1;",
+      [propertyId]
+    );
+    const standardPrice = parseFloat(standardRows?.[0]?.value ?? 150);
+
+    let current = new Date(start);
     let total = 0;
 
-    while (currentDate <= end) {
-      const formattedDate = currentDate.toISOString().split("T")[0];
+    while (current <= end) {
+      const yyyyMmDd = parseIsoDateOnly(current);
 
-      // Fetch specific price for the current date
-      const [specificPriceResult] = await pool.query(
-        "SELECT price FROM date_prices WHERE date = ?;",
-        [formattedDate]
+      const [specificRows] = await pool.query(
+        "SELECT price FROM date_prices WHERE date = ? AND property_id = ? LIMIT 1;",
+        [yyyyMmDd, propertyId]
       );
+      const specific = specificRows?.[0]?.price;
 
-      const specificPrice = specificPriceResult[0]?.price;
-
-      if (specificPrice) {
-        console.log(
-          `Adding specific price for ${formattedDate}: ${specificPrice}`
-        );
-        total += parseFloat(specificPrice);
-      } else {
-        console.log(`Using standard price for ${formattedDate}`);
-        const [standardPriceResult] = await pool.query(
-          "SELECT value FROM standard_price LIMIT 1;"
-        );
-        total += parseFloat(standardPriceResult[0].value);
-      }
-
-      currentDate.setDate(currentDate.getDate() + 1);
+      total += specific != null ? parseFloat(specific) : standardPrice;
+      current.setDate(current.getDate() + 1);
     }
 
     res.json({ total });
   } catch (err) {
-    console.error(err);
+    console.error(`Error calculating total price for ${propertyId}:`, err);
     res.status(500).json({ error: "Error calculating total price" });
   }
 });
 
-app.post("/api/send-booking-emails", async (req, res) => {
+// ---------------------------------------
+// Contact (unchanged path; uses your emailService)
+// POST /api/contact
+// ---------------------------------------
+app.post("/api/contact", async (req, res) => {
+  const { name, email, telephone, message } = req.body || {};
+  if (!name || !email || !message) {
+    return res
+      .status(400)
+      .json({ error: "name, email, and message are required" });
+  }
+
+  try {
+    const html = `
+      <div style="font-family: Arial, sans-serif; color: #333;">
+        <h2>Contact Form Submission</h2>
+        <p><strong>Name:</strong> ${name}</p>
+        <p><strong>Email:</strong> ${email}</p>
+        <p><strong>Telephone:</strong> ${telephone || "—"}</p>
+        <p><strong>Message:</strong></p>
+        <p>${message}</p>
+      </div>
+    `;
+    await sendEmail(
+      process.env.EMAIL_USER,
+      "New Contact Form Message",
+      html,
+      email
+    );
+    res.status(200).json({ message: "Message sent" });
+  } catch (err) {
+    console.error("Error sending contact email:", err);
+    res.status(500).json({ error: "Failed to send message" });
+  }
+});
+
+// ---------------------------------------
+// Booking emails – property-scoped
+// POST /api/send-booking-emails/:propertyId
+// body: { name, email, numberOfPeople, numberOfPets, telephone, message, startDate, endDate, totalPrice }
+// ---------------------------------------
+app.post("/api/send-booking-emails/:propertyId", async (req, res) => {
+  const propertyId = ensureValidProperty(req, res);
+  if (!propertyId) return;
+
   const {
     name,
     email,
@@ -257,66 +444,43 @@ app.post("/api/send-booking-emails", async (req, res) => {
     message,
     startDate,
     endDate,
-    totalPrice, // Add totalPrice from the request body
-  } = req.body;
+    totalPrice,
+  } = req.body || {};
 
   try {
-    const formatDate = (dateString) => {
-      const date = new Date(dateString);
-      const day = String(date.getDate()).padStart(2, "0");
-      const month = String(date.getMonth() + 1).padStart(2, "0");
-      const year = date.getFullYear();
-      return `${day}/${month}/${year}`;
-    };
-
-    const formattedStartDate = formatDate(startDate);
-    const formattedEndDate = formatDate(endDate);
+    const { displayName, logoUrl } = getPropertyConfig(propertyId);
+    const formattedStart = formatDdMmYyyy(startDate);
+    const formattedEnd = formatDdMmYyyy(endDate);
+    const safeTotal = Number.isFinite(Number(totalPrice))
+      ? Number(totalPrice).toFixed(2)
+      : "—";
 
     const customerEmailHtml = `
       <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; border-radius: 5px; background-color: #f9f9f9;">
         <div style="text-align: center; padding-bottom: 20px;">
           <div style="background-color: #000; display: inline-block; padding: 10px; border-radius: 5px;">
-            <img src="https://holidayhomesandlets.co.uk/static/media/Bwythn_Preswylfa_Logo_Enhanced.80503fa2351394cb86a6.png" 
-              alt="Holiday Homes Logo" width="200" />
+            <img src="${logoUrl}" alt="Holiday Homes Logo" width="200" />
           </div>
         </div>
-        
-        <h2 style="color: #333;">Booking Confirmation</h2>
-        <p>Dear <strong>${name}</strong>,</p>
-        <p>Thank you for your booking request! We are reviewing your details and will confirm shortly.</p>
-
-        <h3 style="color: #555;">Booking Details:</h3>
-        <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
-          <tr style="background-color: #eee;">
-            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Check-in Date:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formattedStartDate}</td>
-          </tr>
-          <tr>
-            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Check-out Date:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formattedEndDate}</td>
-          </tr>
-          <tr style="background-color: #eee;">
-            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Number of Guests:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${numberOfPeople}</td>
-          </tr>
-          <tr>
-            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Number of Pets:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${numberOfPets}</td>
-          </tr>
-          <tr style="background-color: #eee;">
-            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Total Price:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">£${totalPrice.toFixed(
-              2
-            )}</td>
-          </tr>
+        <h2>Booking Request Received - ${displayName}</h2>
+        <p>Dear <strong>${name || "Guest"}</strong>,</p>
+        <p>Thank you for your booking request for <strong>${displayName}</strong>! We are reviewing your details and will confirm shortly.</p>
+        <h3>Booking Details</h3>
+        <table style="width:100%; border-collapse: collapse; margin-top: 10px;">
+          <tr style="background:#eee"><td style="padding:8px;border:1px solid #ddd"><strong>Property</strong></td><td style="padding:8px;border:1px solid #ddd">${displayName}</td></tr>
+          <tr><td style="padding:8px;border:1px solid #ddd"><strong>Check-in</strong></td><td style="padding:8px;border:1px solid #ddd">${formattedStart}</td></tr>
+          <tr style="background:#eee"><td style="padding:8px;border:1px solid #ddd"><strong>Check-out</strong></td><td style="padding:8px;border:1px solid #ddd">${formattedEnd}</td></tr>
+          <tr><td style="padding:8px;border:1px solid #ddd"><strong>Guests</strong></td><td style="padding:8px;border:1px solid #ddd">${
+            numberOfPeople ?? "—"
+          }</td></tr>
+          <tr style="background:#eee"><td style="padding:8px;border:1px solid #ddd"><strong>Pets</strong></td><td style="padding:8px;border:1px solid #ddd">${
+            numberOfPets ?? "—"
+          }</td></tr>
+          <tr><td style="padding:8px;border:1px solid #ddd"><strong>Total</strong></td><td style="padding:8px;border:1px solid #ddd">£${safeTotal}</td></tr>
         </table>
-
-        <p>If you have any questions, feel free to contact us at <a href="mailto:hello@holidayhomesandlets.co.uk" style="color: #555; text-decoration: none;">hello@holidayhomesandlets.co.uk</a>.</p>
-
-        <div style="text-align: center; margin-top: 20px;">
-          <a href="https://holidayhomesandlets.co.uk" style="background-color: #008CBA; color: white; padding: 10px 15px; text-decoration: none; border-radius: 5px;">
-            Visit Our Website
-          </a>
+        <p>If you have questions, email <a href="mailto:hello@holidayhomesandlets.co.uk">hello@holidayhomesandlets.co.uk</a>.</p>
+        <div style="text-align:center; margin-top:20px">
+          <a href="https://holidayhomesandlets.co.uk" style="background:#008CBA;color:#fff;padding:10px 15px;text-decoration:none;border-radius:5px">Visit Our Website</a>
         </div>
       </div>
     `;
@@ -325,125 +489,62 @@ app.post("/api/send-booking-emails", async (req, res) => {
       <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; border-radius: 5px; background-color: #f9f9f9;">
         <div style="text-align: center; padding-bottom: 20px;">
           <div style="background-color: #000; display: inline-block; padding: 10px; border-radius: 5px;">
-            <img src="https://holidayhomesandlets.co.uk/static/media/Bwythn_Preswylfa_Logo_Enhanced.80503fa2351394cb86a6.png" 
-              alt="Holiday Homes Logo" width="200" />
+            <img src="${logoUrl}" alt="Holiday Homes Logo" width="200" />
           </div>
         </div>
-        
-        <h2 style="color: #333;">New Booking Request</h2>
-        <p>Hello Lucy,</p>
-        <p>A new booking request has been received. The details are as follows:</p>
-
-        <h3 style="color: #555;">Booking Details:</h3>
-        <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
-          <tr style="background-color: #eee;">
-            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Name:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${name}</td>
-          </tr>
-          <tr>
-            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Email:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${email}</td>
-          </tr>
-          <tr style="background-color: #eee;">
-            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Phone:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${telephone}</td>
-          </tr>
-          <tr>
-            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Check-in Date:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formattedStartDate}</td>
-          </tr>
-          <tr style="background-color: #eee;">
-            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Check-out Date:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formattedEndDate}</td>
-          </tr>
-          <tr>
-            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Number of Guests:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${numberOfPeople}</td>
-          </tr>
-          <tr style="background-color: #eee;">
-            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Number of Pets:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${numberOfPets}</td>
-          </tr>
-          <tr>
-            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Total Price:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">£${totalPrice.toFixed(
-              2
-            )}</td>
-          </tr>
+        <h2>New Booking Request - ${displayName}</h2>
+        <h3>Booking Details</h3>
+        <table style="width:100%; border-collapse: collapse; margin-top: 10px;">
+          <tr style="background:#eee"><td style="padding:8px;border:1px solid #ddd"><strong>Property</strong></td><td style="padding:8px;border:1px solid #ddd">${displayName}</td></tr>
+          <tr><td style="padding:8px;border:1px solid #ddd"><strong>Name</strong></td><td style="padding:8px;border:1px solid #ddd">${
+            name || "—"
+          }</td></tr>
+          <tr style="background:#eee"><td style="padding:8px;border:1px solid #ddd"><strong>Email</strong></td><td style="padding:8px;border:1px solid #ddd">${
+            email || "—"
+          }</td></tr>
+          <tr><td style="padding:8px;border:1px solid #ddd"><strong>Phone</strong></td><td style="padding:8px;border:1px solid #ddd">${
+            telephone || "—"
+          }</td></tr>
+          <tr style="background:#eee"><td style="padding:8px;border:1px solid #ddd"><strong>Check-in</strong></td><td style="padding:8px;border:1px solid #ddd">${formattedStart}</td></tr>
+          <tr><td style="padding:8px;border:1px solid #ddd"><strong>Check-out</strong></td><td style="padding:8px;border:1px solid #ddd">${formattedEnd}</td></tr>
+          <tr style="background:#eee"><td style="padding:8px;border:1px solid #ddd"><strong>Guests</strong></td><td style="padding:8px;border:1px solid #ddd">${
+            numberOfPeople ?? "—"
+          }</td></tr>
+          <tr><td style="padding:8px;border:1px solid #ddd"><strong>Pets</strong></td><td style="padding:8px;border:1px solid #ddd">${
+            numberOfPets ?? "—"
+          }</td></tr>
+          <tr style="background:#eee"><td style="padding:8px;border:1px solid #ddd"><strong>Total</strong></td><td style="padding:8px;border:1px solid #ddd">£${safeTotal}</td></tr>
         </table>
-
-        <p><strong>Message from Customer:</strong></p>
-        <p>${message}</p>
-
+        <p><strong>Message from customer:</strong></p>
+        <p>${message || "—"}</p>
       </div>
     `;
 
     await Promise.all([
-      sendEmail(email, "Your Booking Request Confirmation", customerEmailHtml),
       sendEmail(
-        process.env.EMAIL_USER, // Admin email
-        "New Booking Request", // Subject
-        adminEmailHtml, // Styled admin email
-        email // Reply-to set to customer
+        email,
+        `Your Booking Request Confirmation - ${displayName}`,
+        customerEmailHtml
+      ),
+      sendEmail(
+        process.env.EMAIL_USER,
+        `New Booking Request - ${displayName}`,
+        adminEmailHtml,
+        email
       ),
     ]);
 
     res.status(200).json({ message: "Emails sent successfully" });
   } catch (error) {
-    console.error("Error sending emails:", error);
+    console.error(`Error sending booking emails for ${propertyId}:`, error);
     res.status(500).json({ error: "Failed to send emails" });
   }
 });
 
-app.post("/api/contact", async (req, res) => {
-  const { name, email, message } = req.body;
-
-  try {
-    const emailHtml = `
-      <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; border-radius: 5px; background-color: #f9f9f9;">
-        <div style="text-align: center; padding-bottom: 20px;">
-          <div style="background-color: #000; display: inline-block; padding: 10px; border-radius: 5px;">
-            <img src="https://holidayhomesandlets.co.uk/static/media/Bwythn_Preswylfa_Logo_Enhanced.80503fa2351394cb86a6.png" 
-              alt="Holiday Homes Logo" width="200" />
-          </div>
-        </div>
-        
-        <h2 style="color: #333;">New Contact Request</h2>
-        <p>Hello Lucy,</p>
-        <p>A new contact request has been received. The details are as follows:</p>
-
-        <h3 style="color: #555;">Contact Details:</h3>
-        <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
-          <tr style="background-color: #eee;">
-            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Name:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${name}</td>
-          </tr>
-          <tr>
-            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Email:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${email}</td>
-          </tr>
-        </table>
-
-        <h3 style="color: #555; margin-top: 20px;">Message:</h3>
-        <p style="background-color: #f4f4f4; padding: 10px; border-radius: 5px; border: 1px solid #ddd;">${message}</p>
-      </div>
-    `;
-
-    await sendEmail(
-      process.env.EMAIL_USER, // Admin's email
-      "New Contact Request", // Email subject
-      emailHtml, // Styled HTML content
-      email // Reply-to set to customer's email
-    );
-
-    res.status(200).json({ message: "Message sent successfully!" });
-  } catch (error) {
-    console.error("Error sending contact email:", error);
-    res.status(500).json({ error: "Failed to send message" });
-  }
-});
-
+// ---------------------------------------
+// Start server
+// ---------------------------------------
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
