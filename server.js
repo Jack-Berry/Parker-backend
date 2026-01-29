@@ -1,18 +1,59 @@
 require("dotenv").config();
 
+console.log("=== ENV CHECK ===");
+console.log("PIDDLE_READ_CAL exists?", !!process.env.PIDDLE_READ_CAL);
+console.log("PIDDLE_READ_CAL value:", process.env.PIDDLE_READ_CAL);
+console.log(
+  "PIDDLE_SERVICE_ACCOUNT_EMAIL:",
+  process.env.PIDDLE_SERVICE_ACCOUNT_EMAIL,
+);
+console.log("================");
+
 const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
 const superagent = require("superagent");
 const { google } = require("googleapis");
 
-const { pool, query } = require("./db"); // shared mysql2/promise pool
+const { pool } = require("./db"); // shared mysql2/promise pool
 const { sendEmail } = require("./emailService"); // centralized email helper
 const {
   router: authRoutes,
   authenticateToken,
   requirePropertyAccess,
 } = require("./auth"); // auth router + middleware
+
+// Put this near the top of server.js, after the requires but before you use it
+
+function getTimestamp() {
+  return new Date().toISOString();
+}
+
+function logWithTimestamp(message, meta) {
+  const ts = getTimestamp();
+  if (meta) {
+    try {
+      console.log(ts, message, JSON.stringify(meta, null, 2));
+    } catch {
+      console.log(ts, message, meta);
+    }
+  } else {
+    console.log(ts, message);
+  }
+}
+
+function logErrorWithTimestamp(message, meta) {
+  const ts = getTimestamp();
+  if (meta) {
+    try {
+      console.error(ts, message, JSON.stringify(meta, null, 2));
+    } catch {
+      console.error(ts, message, meta);
+    }
+  } else {
+    console.error(ts, message);
+  }
+}
 
 // ---- Boot diagnostics to confirm entry point on cPanel ----
 console.log("[BOOT] CWD:", process.cwd());
@@ -29,8 +70,9 @@ const allowlist = (process.env.CORS_ORIGINS || "")
 
 const corsOptions = {
   origin: (origin, cb) => {
-    if (!origin || allowlist.length === 0 || allowlist.includes(origin))
+    if (!origin || allowlist.length === 0 || allowlist.includes(origin)) {
       return cb(null, true);
+    }
     return cb(new Error("Not allowed by CORS"));
   },
   credentials: true,
@@ -47,18 +89,61 @@ app.use("/api", authRoutes);
 // Google Calendar config
 // ---------------------------------------
 const GOOGLE_CALENDAR_URL = "https://www.googleapis.com/calendar/v3/calendars";
+const API_KEYS = {
+  preswylfa: process.env.PRESWYLFA_API_KEY || null,
+  "piddle-inn": process.env.PIDDLE_API_KEY || null,
+};
 
+// Normalise PEM in env (replace literal "\n" with real newlines)
 function normalizePrivateKey(pk) {
   return pk ? pk.replace(/\\n/g, "\n") : pk;
 }
 
-const jwtClient = new google.auth.JWT({
-  email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-  key: normalizePrivateKey(process.env.GOOGLE_PRIVATE_KEY || ""),
-  scopes: ["https://www.googleapis.com/auth/calendar.events"],
-});
+// NEW: per-property service account config
+const SERVICE_ACCOUNT_CONFIG = {
+  preswylfa: {
+    // Backwards compatible: fall back to old GOOGLE_* vars if specific ones not set
+    email:
+      process.env.PRESWYLFA_SERVICE_ACCOUNT_EMAIL ||
+      process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL ||
+      null,
+    key: normalizePrivateKey(
+      process.env.PRESWYLFA_PRIVATE_KEY || process.env.GOOGLE_PRIVATE_KEY || "",
+    ),
+  },
+  "piddle-inn": {
+    email: process.env.PIDDLE_SERVICE_ACCOUNT_EMAIL || null,
+    key: normalizePrivateKey(process.env.PIDDLE_PRIVATE_KEY || ""),
+  },
+};
 
-const calendar = google.calendar({ version: "v3", auth: jwtClient });
+// Cache of google.calendar clients keyed by propertyId
+const serviceAccountCalendars = {};
+
+function getServiceAccountCalendar(propertyId) {
+  const cfg = SERVICE_ACCOUNT_CONFIG[propertyId];
+  if (!cfg || !cfg.email || !cfg.key) {
+    throw new Error(
+      `Service account not configured for property '${propertyId}'. ` +
+        `Check SERVICE_ACCOUNT_CONFIG and env vars (EMAIL + PRIVATE_KEY).`,
+    );
+  }
+
+  if (!serviceAccountCalendars[propertyId]) {
+    const jwtClient = new google.auth.JWT({
+      email: cfg.email,
+      key: cfg.key,
+      scopes: ["https://www.googleapis.com/auth/calendar.events"],
+    });
+
+    serviceAccountCalendars[propertyId] = google.calendar({
+      version: "v3",
+      auth: jwtClient,
+    });
+  }
+
+  return serviceAccountCalendars[propertyId];
+}
 
 // ---------------------------------------
 // Properties
@@ -67,21 +152,33 @@ const PROPERTY_CALENDARS = {
   preswylfa: {
     readCalendarId:
       process.env.PRESWYLFA_READ_CAL ||
-      process.env.BNBCALENDAR_ID ||
+      process.env.BNBCALENDAR_ID || // legacy env
       "not_configured",
     writeCalendarId:
       process.env.PRESWYLFA_WRITE_CAL ||
-      process.env.BOOKCAL_ID ||
+      process.env.BOOKCAL_ID || // legacy env
       "not_configured",
     displayName: "Bwthyn Preswylfa",
+    emailUser: process.env.PRESWYLFA_EMAIL_USER,
+    emailPass: process.env.PRESWYLFA_EMAIL_PASS,
+    adminEmail: process.env.ADMIN_EMAIL,
     logoUrl:
       "https://holidayhomesandlets.co.uk/static/media/Bwythn_Preswylfa_Logo_Enhanced.80503fa2351394cb86a6.png",
   },
   "piddle-inn": {
-    readCalendarId: process.env.PIDDLE_READ_CAL || "not_configured",
+    readCalendarIds: [
+      process.env.PIDDLE_READ_CAL_MAIN,
+      process.env.PIDDLE_READ_CAL_AIRBNB,
+      process.env.PIDDLE_READ_CAL_BOOKING,
+      process.env.PIDDLE_READ_CAL_VRBO,
+    ].filter((id) => id && id !== "not_configured"),
     writeCalendarId: process.env.PIDDLE_WRITE_CAL || "not_configured",
     displayName: "Piddle Inn",
-    logoUrl: "https://holidayhomesandlets.co.uk/logo.svg",
+    emailUser: process.env.PIDDLE_EMAIL_USER,
+    emailPass: process.env.PIDDLE_EMAIL_PASS,
+    adminEmail: process.env.ADMIN_EMAIL,
+    logoUrl:
+      "https://www.holidayhomesandlets.co.uk/static/media/piddle-logo.2010f659a389e09283e3.png",
   },
 };
 
@@ -92,6 +189,12 @@ const DEFAULT_PROPERTY = process.env.DEFAULT_PROPERTY || "preswylfa";
 function getPropertyConfig(propertyId) {
   const cfg = PROPERTY_CALENDARS[propertyId];
   if (!cfg) throw new Error(`Unknown property: ${propertyId}`);
+
+  // Normalize: ensure readCalendarIds is always an array
+  if (cfg.readCalendarId && !cfg.readCalendarIds) {
+    cfg.readCalendarIds = [cfg.readCalendarId];
+  }
+
   return cfg;
 }
 
@@ -104,8 +207,6 @@ function getValidPropertyId(req, res) {
   }
   return propertyId;
 }
-
-const apiKey = process.env.GOOGLE_API_KEY; // used for reads
 
 // ---------------------------------------
 // Utilities
@@ -158,74 +259,149 @@ app.get("/api/debug/routes", (_req, res) => {
 // Auto-switches between API key (public) and service account (private).
 // ---------------------------------------
 app.get("/api/events/:propertyId?", async (req, res) => {
+  const propertyId = req.params.propertyId || DEFAULT_PROPERTY;
+  let mode = null;
+
+  // Set cache-control headers to prevent browser caching
+  res.set({
+    "Cache-Control": "no-store, no-cache, must-revalidate, private, max-age=0",
+    Pragma: "no-cache",
+    Expires: "0",
+  });
+
   try {
-    // Keep legacy working: default property if route param omitted
-    const DEFAULT_PROPERTY = process.env.DEFAULT_PROPERTY || "preswylfa";
-    const propertyId = req.params.propertyId || DEFAULT_PROPERTY;
-
-    // Resolve calendar IDs in a backward-compatible way
-    const READ_IDS = {
-      preswylfa:
-        process.env.PRESWYLFA_READ_CAL ||
-        process.env.BNBCALENDAR_ID || // legacy env
-        "not_configured",
-      "piddle-inn": process.env.PIDDLE_READ_CAL || "not_configured",
-    };
-
-    if (!Object.prototype.hasOwnProperty.call(READ_IDS, propertyId)) {
+    if (!VALID_PROPERTIES.includes(propertyId)) {
+      logErrorWithTimestamp("[/api/events] Invalid propertyId", { propertyId });
       return res.status(400).json({ error: `Unknown property: ${propertyId}` });
     }
 
-    const readCalendarId = READ_IDS[propertyId];
-    if (!readCalendarId || readCalendarId === "not_configured") {
-      // Keep UI stable; empty items instead of a 500
-      console.warn(`[events] No readCalendarId for property '${propertyId}'`);
+    const propertyCfg = getPropertyConfig(propertyId);
+    const readCalendarIds = propertyCfg.readCalendarIds || [];
+
+    if (!readCalendarIds.length) {
+      logWithTimestamp("[/api/events] No readCalendarIds configured", {
+        propertyId,
+      });
       return res.json({ items: [] });
     }
 
-    // Decide mode: API key (public) vs Service Account (private)
-    const apiKey =
-      process.env.GOOGLE_API_KEY && process.env.GOOGLE_API_KEY.trim();
-    const GOOGLE_CALENDAR_URL =
-      "https://www.googleapis.com/calendar/v3/calendars";
+    // Get property-specific API key
+    const apiKey = API_KEYS[propertyId];
+    const rawApiKey = apiKey && apiKey.trim();
 
-    // Time window (adjust as needed)
+    // Time window (now -> 1 year ahead)
     const now = new Date();
     const oneYearAhead = new Date(now);
     oneYearAhead.setFullYear(now.getFullYear() + 1);
 
-    if (apiKey) {
-      // ---- API KEY MODE (public calendars) ----
-      const url =
-        `${GOOGLE_CALENDAR_URL}/${encodeURIComponent(readCalendarId)}/events` +
-        `?key=${apiKey}` +
-        `&singleEvents=true&orderBy=startTime` +
-        `&timeMin=${encodeURIComponent(now.toISOString())}` +
-        `&timeMax=${encodeURIComponent(oneYearAhead.toISOString())}` +
-        `&maxResults=2500`;
+    // Collect events from all calendars
+    const allItems = [];
 
-      const response = await require("superagent").get(url);
-      const data = JSON.parse(response.text);
-      return res.json({ items: Array.isArray(data.items) ? data.items : [] });
-    } else {
-      // ---- SERVICE ACCOUNT MODE (private calendars) ----
-      // Requires you to have already created:
-      //   const jwtClient = new google.auth.JWT({ ... });
-      //   const calendar = google.calendar({ version: "v3", auth: jwtClient });
-      const response = await calendar.events.list({
-        calendarId: readCalendarId,
-        timeMin: now.toISOString(),
-        timeMax: oneYearAhead.toISOString(),
-        singleEvents: true,
-        orderBy: "startTime",
-        maxResults: 2500,
-      });
-      return res.json({ items: response.data.items || [] });
+    for (const readCalendarId of readCalendarIds) {
+      if (!readCalendarId || readCalendarId === "not_configured") continue;
+
+      try {
+        if (rawApiKey) {
+          // ---- API KEY MODE (public calendars) ----
+          mode = "apiKey";
+
+          const url =
+            `${GOOGLE_CALENDAR_URL}/${encodeURIComponent(readCalendarId)}/events` +
+            `?key=${rawApiKey}` +
+            `&singleEvents=true&orderBy=startTime` +
+            `&timeMin=${encodeURIComponent(now.toISOString())}` +
+            `&timeMax=${encodeURIComponent(oneYearAhead.toISOString())}` +
+            `&maxResults=2500`;
+
+          logWithTimestamp("[/api/events] Fetching via API key", {
+            propertyId,
+            readCalendarId,
+          });
+
+          const response = await superagent.get(url);
+          const data = JSON.parse(response.text);
+
+          if (Array.isArray(data.items)) {
+            allItems.push(...data.items);
+          }
+
+          logWithTimestamp("[/api/events] API key fetch OK", {
+            propertyId,
+            readCalendarId,
+            count: Array.isArray(data.items) ? data.items.length : 0,
+          });
+        } else {
+          // ---- SERVICE ACCOUNT MODE (fallback for private calendars) ----
+          mode = "serviceAccount";
+          const calendarClient = getServiceAccountCalendar(propertyId);
+
+          logWithTimestamp("[/api/events] Fetching via service account", {
+            propertyId,
+            readCalendarId,
+            serviceAccountEmail:
+              SERVICE_ACCOUNT_CONFIG[propertyId]?.email || null,
+          });
+
+          const response = await calendarClient.events.list({
+            calendarId: readCalendarId,
+            timeMin: now.toISOString(),
+            timeMax: oneYearAhead.toISOString(),
+            singleEvents: true,
+            orderBy: "startTime",
+            maxResults: 2500,
+          });
+
+          const items = response.data.items || [];
+          allItems.push(...items);
+
+          logWithTimestamp("[/api/events] Service account fetch OK", {
+            propertyId,
+            readCalendarId,
+            count: items.length,
+          });
+        }
+      } catch (calErr) {
+        // Log error for this specific calendar but continue with others
+        logErrorWithTimestamp("[/api/events] Error fetching from calendar", {
+          propertyId,
+          readCalendarId,
+          mode,
+          error: calErr?.response?.data || calErr.message || calErr,
+        });
+      }
     }
+
+    // Remove duplicates (same event might appear in multiple calendars)
+    const uniqueItems = [];
+    const seen = new Set();
+
+    for (const item of allItems) {
+      // Create a unique key based on start/end time and summary
+      const key = `${item.start?.dateTime || item.start?.date}-${item.end?.dateTime || item.end?.date}-${item.summary}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        uniqueItems.push(item);
+      }
+    }
+
+    logWithTimestamp("[/api/events] All calendars fetched", {
+      propertyId,
+      totalEvents: uniqueItems.length,
+      calendarsChecked: readCalendarIds.length,
+    });
+
+    return res.json({ items: uniqueItems });
   } catch (err) {
-    console.error("Calendar read error:", err?.response?.data || err.message);
+    const safeError = err?.response?.data || err.message || err;
+
+    logErrorWithTimestamp("[/api/events] Calendar read error", {
+      propertyId,
+      mode,
+      error: safeError,
+    });
+
     // Keep frontend resilient
-    res.json({ items: [] });
+    return res.json({ items: [] });
   }
 });
 
@@ -268,7 +444,9 @@ app.post("/api/add-event/:propertyId?", async (req, res) => {
       },
     };
 
-    const response = await calendar.events.insert({
+    const calendarClient = getServiceAccountCalendar(propertyId);
+
+    const response = await calendarClient.events.insert({
       calendarId: writeCalendarId,
       resource: event,
     });
@@ -287,23 +465,29 @@ app.post("/api/add-event/:propertyId?", async (req, res) => {
 // Debug endpoint — see which mode & IDs are live
 // ---------------------------------------
 app.get("/api/debug/calendar/:propertyId?", (req, res) => {
-  const DEFAULT_PROPERTY = process.env.DEFAULT_PROPERTY || "preswylfa";
   const propertyId = req.params.propertyId || DEFAULT_PROPERTY;
+
+  const propertyCfg = PROPERTY_CALENDARS[propertyId] || {};
+  const saCfg = SERVICE_ACCOUNT_CONFIG[propertyId] || {};
 
   const info = {
     propertyId,
-    apiKeyPresent: Boolean(
-      process.env.GOOGLE_API_KEY && process.env.GOOGLE_API_KEY.trim(),
-    ),
+    apiKeyPresent: Boolean(apiKey && apiKey.trim()),
+    usingServiceAccount: SERVICE_ACCOUNT_ONLY_PROPERTIES.has(propertyId),
     env: {
       PRESWYLFA_READ_CAL: process.env.PRESWYLFA_READ_CAL ? "(set)" : "(unset)",
       PIDDLE_READ_CAL: process.env.PIDDLE_READ_CAL ? "(set)" : "(unset)",
       BNBCALENDAR_ID: process.env.BNBCALENDAR_ID ? "(set)" : "(unset)", // legacy
+      PRESWYLFA_SERVICE_ACCOUNT_EMAIL: process.env
+        .PRESWYLFA_SERVICE_ACCOUNT_EMAIL
+        ? "(set)"
+        : "(unset)",
+      PIDDLE_SERVICE_ACCOUNT_EMAIL: process.env.PIDDLE_SERVICE_ACCOUNT_EMAIL
+        ? "(set)"
+        : "(unset)",
     },
-    resolvedReadCalendarId:
-      (propertyId === "preswylfa"
-        ? process.env.PRESWYLFA_READ_CAL || process.env.BNBCALENDAR_ID
-        : process.env.PIDDLE_READ_CAL) || "(not_configured)",
+    resolvedReadCalendarId: propertyCfg.readCalendarId || "(not_configured)",
+    serviceAccountEmail: saCfg.email || "(none)",
   };
 
   res.json(info);
@@ -552,6 +736,21 @@ app.post("/api/contact", async (req, res) => {
   }
 });
 
+// Add this to server.js temporarily
+app.get("/api/debug/config/:propertyId", (req, res) => {
+  const propertyId = req.params.propertyId;
+  const cfg = PROPERTY_CALENDARS[propertyId];
+  res.json({
+    propertyId,
+    readCalendarId: cfg?.readCalendarId,
+    writeCalendarId: cfg?.writeCalendarId,
+    serviceAccountEmail: SERVICE_ACCOUNT_CONFIG[propertyId]?.email,
+    hasPrivateKey: Boolean(SERVICE_ACCOUNT_CONFIG[propertyId]?.key),
+    origin: req.headers.origin,
+    userAgent: req.headers["user-agent"],
+  });
+});
+
 // ---------------------------------------
 // Booking emails – property-aware (propertyId optional)
 // POST /api/send-booking-emails OR /api/send-booking-emails/:propertyId
@@ -645,17 +844,28 @@ app.post("/api/send-booking-emails/:propertyId?", async (req, res) => {
       </div>
     `;
 
+    const propertyCfg = getPropertyConfig(propertyId);
+
     await Promise.all([
+      // Email to customer
       sendEmail(
         email,
         `Your Booking Request Confirmation - ${displayName}`,
         customerEmailHtml,
+        propertyCfg.emailUser, // replyTo
+        propertyCfg.emailUser, // emailUser
+        propertyCfg.emailPass, // emailPass
+        displayName, // propertyName
       ),
+      // Email to admin/owner
       sendEmail(
-        process.env.EMAIL_USER,
+        propertyCfg.adminEmail,
         `New Booking Request - ${displayName}`,
         adminEmailHtml,
-        email,
+        email, // replyTo (customer email)
+        propertyCfg.emailUser, // emailUser
+        propertyCfg.emailPass, // emailPass
+        displayName, // propertyName
       ),
     ]);
 
